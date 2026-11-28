@@ -42,3 +42,100 @@ function DestroyProcess() {
   return $_STATE
 
 }
+
+# Current Tor invocations use "tor -f /var/lib/multitor/PORT/PORT.torrc".
+# Older invocations add options after that pair. Check whole arguments so an
+# unrelated daemon, or a shell mentioning a script name, is never selected.
+# _lib and _multitor_directory are set by the launcher.
+# shellcheck disable=SC2154
+function _is_managed_process() {
+  local proc="$1" name port pid recorded ns_pid cmp_status
+  local -a argv
+  IFS= read -r name < "$proc/comm" || return 1
+  case "$name" in
+    tor|python3*) ;;
+    *) return 1 ;;
+  esac
+  mapfile -d '' -t -n 3 argv < "$proc/cmdline" || return 1
+  (( ${#argv[@]} >= 2 )) || return 1
+  if [[ "$name" == tor ]]; then
+    (( ${#argv[@]} == 3 )) || return 1
+    port="${argv[2]##*/}"
+    port="${port%.torrc}"
+    [[ "${argv[1]}" == -f && "$port" =~ ^[0-9]+$ &&
+       "${argv[2]}" == "${_multitor_directory}/${port}/${port}.torrc" ]] || return 1
+  else
+    [[ "${argv[1]}" == /* &&
+       ( "${argv[1]}" -ef "${_lib}/custom_lb.py" || "${argv[1]}" -ef "${_lib}/api_server.py" ) ]] || return 1
+  fi
+
+  # Whole paths are meaningful only in our mount and PID namespaces.
+  [[ "$proc/ns/pid" -ef /proc/self/ns/pid && "$proc/ns/mnt" -ef /proc/self/ns/mnt ]] && return 0
+  [[ "$name" == tor ]] || return 1
+  [[ ! -e "$proc/ns/pid" || "$proc/ns/pid" -ef /proc/self/ns/pid ]] || return 1
+  [[ ! -e "$proc/ns/mnt" || "$proc/ns/mnt" -ef /proc/self/ns/mnt ]] || return 1
+
+  # Docker can deny namespace-link access for a Tor running under --user.
+  # NSpid must contain a single ID in this procfs. Compare the mount IDs and
+  # the PID recorded in the local data directory before sending any signal.
+  pid="${proc##*/}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -d "$proc" ]] || return 1
+  ns_pid=$(awk '$1 == "NSpid:" {print $2, NF; exit}' "$proc/status") || return 2
+  [[ -n "$ns_pid" ]] || return 2
+  [[ "$ns_pid" == "$pid 2" ]] || return 1
+  cmp -s /proc/self/mountinfo "$proc/mountinfo" && cmp_status=0 || cmp_status=$?
+  (( cmp_status != 1 )) || return 1
+  if (( cmp_status == 0 )) &&
+     IFS= read -r recorded < "${_multitor_directory}/${port}/${port}.pid" &&
+     [[ "$recorded" == "$pid" ]]; then
+    return 0
+  fi
+  # A possible local Tor is still live. Preserve its files until its
+  # identity is unambiguous or it exits.
+  [[ -d "$proc" ]] && return 2
+  return 1
+}
+
+function StopManagedProcesses() {
+  local proc pid attempt
+  local -a pending=() remaining
+  # kill takes IDs in the caller's namespace. Refuse a procfs mounted by an
+  # ancestor namespace, even if one of the records has matching paths.
+  if [[ ! /proc/self -ef /proc/${BASHPID} ]]; then
+    _logger "stop" "Cannot use this procfs to identify local processes."
+    return 1
+  fi
+  for proc in /proc/[0-9]*; do
+    if _is_managed_process "$proc" 2>/dev/null; then
+      pid="${proc##*/}"
+      pending+=("$pid")
+      if kill -TERM "$pid" 2>/dev/null; then
+        # A paused Tor needs to run to handle TERM. A running process may
+        # have already exited by the time CONT arrives.
+        kill -CONT "$pid" 2>/dev/null || true
+      fi
+    elif [[ $? == 2 ]]; then
+      _logger "stop" "Cannot verify ownership of a Tor process. Preserving Tor data directories."
+      return 1
+    fi
+  done
+  if (( ${#pending[@]} )); then
+    # Read by the --kill branch of __main__.
+    # shellcheck disable=SC2034
+    kill_status=1
+  fi
+  for ((attempt=0; attempt<100 && ${#pending[@]}; attempt++)); do
+    remaining=()
+    for pid in "${pending[@]}"; do
+      if _is_managed_process "/proc/$pid" 2>/dev/null || [[ $? == 2 ]]; then
+        remaining+=("$pid")
+      fi
+    done
+    pending=("${remaining[@]}")
+    if (( ${#pending[@]} )); then sleep 0.1; fi
+  done
+  if (( ${#pending[@]} )); then
+    _logger "stop" "Managed processes are still running. Preserving Tor data directories."
+  fi
+}

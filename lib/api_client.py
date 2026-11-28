@@ -34,7 +34,7 @@ class ApiClient:
 
     def pause_all_except(self, top_proxies):
         try:
-            response = requests.post(f"{self.base_url}/pause_all_except", json={'top_proxies': top_proxies})
+            response = requests.post(f"{self.base_url}/pause_all_except", json={'top_proxies': top_proxies}, timeout=5)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -43,7 +43,7 @@ class ApiClient:
 
     def resume_all(self):
         try:
-            response = requests.post(f"{self.base_url}/resume_all")
+            response = requests.post(f"{self.base_url}/resume_all", timeout=5)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:

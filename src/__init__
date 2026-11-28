@@ -232,6 +232,9 @@ function __main__() {
 
   # Dynamically build the list of commands to check based on proxy_type
   local commands_to_check=("${essential_commands[@]}")
+  if [[ "$init_state" -eq 1 || "$kill_state" -eq 1 ]]; then
+    commands_to_check+=(flock)
+  fi
   if [[ "$proxy_state" -eq 1 ]] ; then
     if [[ "$proxy_type" == "socks" || "$frontend_type" == "haproxy" || "$proxy_type" == "polipo" || "$proxy_type" == "privoxy" ]] ; then
       commands_to_check+=("haproxy")
@@ -274,6 +277,18 @@ function __main__() {
     # _exit_ "1" # _logger stop will exit
   fi
 
+  if [[ "$init_state" -eq 1 || "$kill_state" -eq 1 ]]; then
+    # Both commands replace the same state tree. Hold the lock in the launcher
+    # and close its descriptor for the entire action, including all daemons.
+    exec 9>/run/multitor.lock || _logger "stop" "Cannot open the multitor lock."
+    flock -n 9 || _logger "stop" "Another multitor init or kill is in progress."
+    _run_actions 9>&-
+  else
+    _run_actions
+  fi
+}
+
+function _run_actions() {
   # Running tasks before start user functions.
   _before_init
 
@@ -514,42 +529,10 @@ function __main__() {
 
   if [[ "$init_state" -eq 1 ]] ; then
 
-    # First, we remove current processes.
-    # _tor_processes=($(pidof tor))
-    IFS=" " read -r -a _tor_processes <<< "$(pidof "tor")"
-
-    if [[ ${#_tor_processes[@]} -ne 0 ]] ; then
-
-      for _tpr in "${_tor_processes[@]}" ; do
-
-        # In this case, we can search for a specific identifier (${_tpr}).
-        # shellcheck disable=SC2009
-        _tproc=$(ps -ax | grep "multitor" | grep ".pid" | grep -v "grep" | grep "$_tpr")
-
-        if [[ -z "$_tproc" ]] ; then
-
-          _logger "warn" \
-            "${_FUNCTION_ID}()" \
-            "not found or unknown tor process"
-
-        else
-
-          DestroyProcess "${_tpr}"
-
-        fi
-
-      done
-
-    else
-
-      _logger "warn" \
-        "${_FUNCTION_ID}()" \
-        "not found tor processes: ${_tpr}"
-
-    fi
+    StopManagedProcesses
 
     # Removed all multitor process data directory.
-    find ${_multitor_directory}/* -delete >>"$_log_stdout" 2>&1
+    find "${_multitor_directory}"/* -delete >>"$_log_stdout" 2>&1
 
     # Generate random password.
     # Does storing the password in this form is security issue?
@@ -626,8 +609,10 @@ function __main__() {
           "Tor process for SOCKS ${socks_port_number} failed to start. Not adding to health monitoring."
       fi
 
-      # For proxy:
-      _proxy_ports+=("$socks_port_number")
+      # A failed launch has no SOCKS or control endpoint to monitor.
+      if [[ "$proxy_type" != "custom_lb" || $_create_status -eq 0 ]]; then
+        _proxy_ports+=("$socks_port_number")
+      fi
 
       # In this case, we can search for a specific identifier (${socks_port_number}).
       # shellcheck disable=SC2009
@@ -753,44 +738,10 @@ function __main__() {
 
   elif [[ "$kill_state" -eq 1 ]] ; then
 
-    # First, we remove current processes.
-    # _tor_processes=($(pidof tor))
-    IFS=" " read -r -a _tor_processes <<< "$(pidof "tor")"
-
-    if [[ ${#_tor_processes[@]} -ne 0 ]] ; then
-
-      for _tpr in "${_tor_processes[@]}" ; do
-
-        # In this case, we can search for a specific identifier (${_tpr}).
-        # shellcheck disable=SC2009
-        _tproc=$(ps -ax | grep "multitor" | grep ".pid" | grep -v "grep" | grep "$_tpr")
-
-        if [[ -z "$_tproc" ]] ; then
-
-          _logger "warn" \
-            "${_FUNCTION_ID}()" \
-            "not found or unknown tor process"
-
-        else
-
-          DestroyProcess "${_tpr}"
-
-          kill_status="1"
-
-        fi
-
-      done
-
-    else
-
-      _logger "warn" \
-        "${_FUNCTION_ID}()" \
-        "not found tor processes: ${_tpr}"
-
-    fi
+    StopManagedProcesses
 
     # Removed all multitor process data directory.
-    find ${_multitor_directory}/* -delete >>"$_log_stdout" 2>&1
+    find "${_multitor_directory}"/* -delete >>"$_log_stdout" 2>&1
 
     # shellcheck disable=SC2034,SC2154
     local _tml_ha0="${_tml}/haproxy-template.cfg"
@@ -834,43 +785,6 @@ function __main__() {
       kill_status="1"
 
     done
-
-    # Specifically kill the custom_lb.py script if it's running
-    # Using pkill to find the process by its script name.
-    # This is simpler than managing PID files for this specific case within the existing structure immediately.
-    # Make sure this is robust enough or adapt to use PID files later if needed.
-    _custom_lb_pids=$(pgrep -f "python3 ${_lib}/custom_lb.py" || true)
-    if [[ -n "$_custom_lb_pids" ]] ; then
-      _logger "info" \
-        "${_FUNCTION_ID}()" \
-        "Attempting to kill custom_lb.py processes: $_custom_lb_pids"
-      # Using kill directly as DestroyProcess is more for daemons with PID files
-      # and specific multitor structure.
-      # shellcheck disable=SC2046
-      kill $(echo "$_custom_lb_pids") >>"$_log_stdout" 2>&1
-      # Brief pause to allow process to terminate
-      sleep 0.5
-      # Confirm kill
-      _custom_lb_pids_after_kill=$(pgrep -f "python3 ${_lib}/custom_lb.py" || true)
-      if [[ -z "$_custom_lb_pids_after_kill" ]]; then
-        _logger "info" \
-          "${_FUNCTION_ID}()" \
-          "custom_lb.py process(es) killed successfully."
-        kill_status="1"
-      else
-        _logger "warn" \
-          "${_FUNCTION_ID}()" \
-          "Failed to kill all custom_lb.py process(es). PIDs remaining: $_custom_lb_pids_after_kill. Forcing kill."
-        # shellcheck disable=SC2046
-        kill -9 $(echo "$_custom_lb_pids_after_kill") >>"$_log_stdout" 2>&1
-        kill_status="1" # Still set kill_status, as an attempt was made.
-      fi
-    else
-      _logger "info" \
-        "${_FUNCTION_ID}()" \
-        "custom_lb.py process not found, no need to kill."
-    fi
-
 
     if [[ "$kill_status" -eq 1 ]] ; then
 
