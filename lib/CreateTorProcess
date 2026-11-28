@@ -147,6 +147,7 @@ function CreateTorProcess() {
       "no process was created"
 
     _tor_processes_fail=$((_tor_processes_fail + 1))
+    _STATE=1
 
   fi
 
